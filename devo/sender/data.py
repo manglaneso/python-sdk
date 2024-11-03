@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-""" File to group all the classes and functions related to the connection
-and sending of data to Devo """
+"""File to group all the classes and functions related to the connection
+and sending of data to Devo"""
+
 import errno
 import logging
 import select
@@ -9,62 +10,77 @@ import ssl
 import sys
 import time
 import zlib
-from _socket import SHUT_WR, SHUT_RD
 from enum import Enum
 from pathlib import Path
+from ssl import SSLWantReadError, SSLWantWriteError
+from threading import Thread, Lock, Event
+from typing import Optional, Callable
+import warnings
 
 import pem
+from _socket import SHUT_WR
 from OpenSSL import SSL, crypto
-from ssl import SSLWantReadError, SSLWantWriteError
 
 from devo.common import Configuration, get_log, get_stream_handler
+
 from .transformsyslog import (COMPOSE, COMPOSE_BYTES, FACILITY_USER, FORMAT_MY,
                               FORMAT_MY_BYTES, SEVERITY_INFO, priority_map)
 
-PYPY = hasattr(sys, 'pypy_version_info')
+PYPY = hasattr(sys, "pypy_version_info")
 
 
 class ERROR_MSGS(str, Enum):
+
     def __str__(self):
         return str(self.value)
 
-    WRONG_FILE_TYPE = "'%s' is not a valid type to be opened as a file",
-    ADDRESS_TUPLE = "Devo-SenderConfigSSL| address must be a tuple (\"hostname\", int(port))'",
-    WRONG_SSL_CONFIG = "Devo-SenderConfigSSL|Can't create SSL config: %s",
-    CONFIG_FILE_NOT_FOUND = "Error in the configuration, %s is not a file or the path does not" \
-                            " exist",
-    CANT_READ_CONFIG_FILE = "Error in the configuration %s can't be read\noriginal error: %s",
-    CONFIG_FILE_PROBLEM = "Error in the configuration, %s problem related to: %s",
-    KEY_NOT_COMPATIBLE_WITH_CERT = "Error in the configuration, the key: %s is not compatible" \
-                                   " with the cert: %s\noriginal error: %s",
-    CHAIN_NOT_COMPATIBLE_WITH_CERT = "Error in config, the chain: %s is not compatible with the" \
-                                     " certificate: %s\noriginal error: %s",
-    TIMEOUT_RELATED_TO_AN_INCORRECT_ADDRESS_PORT = "Possible error in config, a timeout could be" \
-                                                   " related to an incorrect address/port: %s\n" \
-                                                   "original error: %s",
-    INCORRECT_ADDRESS_PORT = "Error in config, incorrect address/port: %s\noriginal error: %s",
-    CERTIFICATE_IN_ADDRESS_IS_NOT_COMPATIBLE = "Error in config, the certificate in the address:" \
-                                               " %s is not compatible with: %s",
-    ADDRESS_MUST_BE_A_TUPLE = "Devo-SenderConfigSSL| address must be a tuple '(\"hostname\"," \
-                              " int(port))'",
-    CANT_CREATE_TCP_CONFIG = "DevoSenderConfigTCP|Can't create TCP config: %s",
-    PROBLEMS_WITH_SENDER_ARGS = "Problems with args passed to Sender",
-    TCP_CONN_ESTABLISHMENT_SOCKET = "TCP conn establishment socket error: %s",
-    SSL_CONN_ESTABLISHMENT_SOCKET = "SSL conn establishment socket error: %s",
-    PFX_CERTIFICATE_READ_FAILED = "PFX Certificate read failed: %s",
-    SEND_ERROR = "Send error",
-    SOCKET_ERROR = "Socket error: %s",
-    SOCKET_CANT_CONNECT_UNKNOWN_ERROR = "Socket cant connect: unknown error",
-    NO_ADDRESS = "No address",
-    MULTILINE_SENDING_ERROR = "Error sending multiline event: %s",
-    RAW_SENDING_ERROR = "Error sending raw event: %s",
+    WRONG_FILE_TYPE = ("'%s' is not a valid type to be opened as a file",)
+    ADDRESS_TUPLE = ('Devo-SenderConfigSSL| address must be a tuple ("hostname", int(port))\'',)
+    WRONG_SSL_CONFIG = ("Devo-SenderConfigSSL|Can't create SSL config: %s",)
+    CONFIG_FILE_NOT_FOUND = (
+        "Error in the configuration, %s is not a file or the path does not exist",
+    )
+    CANT_READ_CONFIG_FILE = ("Error in the configuration %s can't be read\noriginal error: %s",)
+    CONFIG_FILE_PROBLEM = ("Error in the configuration, %s problem related to: %s",)
+    KEY_NOT_COMPATIBLE_WITH_CERT = (
+        "Error in the configuration, the key: %s is not compatible"
+        " with the cert: %s\noriginal error: %s",
+    )
+    CHAIN_NOT_COMPATIBLE_WITH_CERT = (
+        "Error in config, the chain: %s is not compatible with the"
+        " certificate: %s\noriginal error: %s",
+    )
+    TIMEOUT_RELATED_TO_AN_INCORRECT_ADDRESS_PORT = (
+        "Possible error in config, a timeout could be"
+        " related to an incorrect address/port: %s\n"
+        "original error: %s",
+    )
+    INCORRECT_ADDRESS_PORT = ("Error in config, incorrect address/port: %s\noriginal error: %s",)
+    CERTIFICATE_IN_ADDRESS_IS_NOT_COMPATIBLE = (
+        "Error in config, the certificate in the address: %s is not compatible with: %s",
+    )
+    ADDRESS_MUST_BE_A_TUPLE = (
+        'Devo-SenderConfigSSL| address must be a tuple \'("hostname",' " int(port))'",
+    )
+    CANT_CREATE_TCP_CONFIG = ("DevoSenderConfigTCP|Can't create TCP config: %s",)
+    PROBLEMS_WITH_SENDER_ARGS = ("Problems with args passed to Sender",)
+    TCP_CONN_ESTABLISHMENT_SOCKET = ("TCP conn establishment socket error: %s",)
+    SSL_CONN_ESTABLISHMENT_SOCKET = ("SSL conn establishment socket error: %s",)
+    PFX_CERTIFICATE_READ_FAILED = ("PFX Certificate read failed: %s",)
+    SEND_ERROR = ("Send error",)
+    SOCKET_ERROR = ("Socket error: %s",)
+    SOCKET_CANT_CONNECT_UNKNOWN_ERROR = ("Socket cant connect: unknown error",)
+    NO_ADDRESS = ("No address",)
+    MULTILINE_SENDING_ERROR = ("Error sending multiline event: %s",)
+    RAW_SENDING_ERROR = ("Error sending raw event: %s",)
     CLOSING_ERROR = "Error closing connection"
     FLUSHING_BUFFER_ERROR = "Error flushing buffer"
+    ERROR_AFTER_TIMEOUT = "Timeout reached"
 
 
 class DevoSenderException(Exception):
-    """ Default Devo Sender Exception for functionalities related to sending
-     events to the platform"""
+    """Default Devo Sender Exception for functionalities related to sending
+    events to the platform"""
 
     def __init__(self, message: str):
         """
@@ -73,9 +89,14 @@ class DevoSenderException(Exception):
         :param message: Message describing the exception. It will be also
          used as `args` attribute in `Exception` class
         """
+        if not isinstance(message, str):
+            raise TypeError(f'must be str, not {type(message).__name__}')
         self.message: str = message
         """Message describing exception"""
         super().__init__(self.message)
+
+    def __str__(self):
+        return self.message
 
 
 class SenderConfigSSL:
@@ -102,9 +123,18 @@ class SenderConfigSSL:
 
     """
 
-    def __init__(self, address=None, key=None, cert=None, chain=None,
-                 pkcs=None, sec_level=None, check_hostname=True,
-                 verify_mode=None, verify_config=False):
+    def __init__(
+        self,
+        address=None,
+        key=None,
+        cert=None,
+        chain=None,
+        pkcs=None,
+        sec_level=None,
+        check_hostname=True,
+        verify_mode=None,
+        verify_config=False,
+    ):
         if not isinstance(address, tuple):
             raise DevoSenderException(ERROR_MSGS.ADDRESS_TUPLE)
         try:
@@ -119,8 +149,7 @@ class SenderConfigSSL:
             self.verify_config = verify_config
             self.verify_mode = verify_mode
         except Exception as error:
-            raise DevoSenderException(
-                ERROR_MSGS.WRONG_SSL_CONFIG % str(error)) from error
+            raise DevoSenderException(ERROR_MSGS.WRONG_SSL_CONFIG % str(error)) from error
 
         if self.verify_config:
             self.check_config_files_path()
@@ -138,20 +167,17 @@ class SenderConfigSSL:
         certificates = [self.key, self.chain, self.cert]
         for file in certificates:
             try:
-                if not (file.is_file() if isinstance(file, Path) else Path(
-                        file).is_file()):
-                    raise DevoSenderException(
-                        ERROR_MSGS.CONFIG_FILE_NOT_FOUND % file)
+                if not (file.is_file() if isinstance(file, Path) else Path(file).is_file()):
+                    raise DevoSenderException(ERROR_MSGS.CONFIG_FILE_NOT_FOUND % file)
             except IOError as error:
                 if error.errno == errno.EACCES:
                     raise DevoSenderException(
-                        ERROR_MSGS.CANT_READ_CONFIG_FILE % (
-                            file, str(error))) \
-                        from error
+                        ERROR_MSGS.CANT_READ_CONFIG_FILE % (file, str(error))
+                    ) from error
                 else:
                     raise DevoSenderException(
-                        ERROR_MSGS.CONFIG_FILE_PROBLEM % (file, str(error))) \
-                        from error
+                        ERROR_MSGS.CONFIG_FILE_PROBLEM % (file, str(error))
+                    ) from error
         return True
 
     def check_config_certificate_key(self):
@@ -162,15 +188,13 @@ class SenderConfigSSL:
         :return: Boolean true or raises an exception
         """
 
-        with open_file(self.cert, mode="rb") as certificate_file, \
-                open_file(self.key, mode="rb") as key_file:
-
+        with open_file(self.cert, mode="rb") as certificate_file, open_file(
+            self.key, mode="rb"
+        ) as key_file:
             certificate_raw = certificate_file.read()
             key_raw = key_file.read()
-            certificate_obj = crypto.load_certificate(
-                crypto.FILETYPE_PEM, certificate_raw)
-            private_key_obj = crypto.load_privatekey(
-                crypto.FILETYPE_PEM, key_raw)
+            certificate_obj = crypto.load_certificate(crypto.FILETYPE_PEM, certificate_raw)
+            private_key_obj = crypto.load_privatekey(crypto.FILETYPE_PEM, key_raw)
             context = SSL.Context(SSL.TLS_CLIENT_METHOD)
             context.use_privatekey(private_key_obj)
             context.use_certificate(certificate_obj)
@@ -178,9 +202,8 @@ class SenderConfigSSL:
             context.check_privatekey()
         except SSL.Error as error:
             raise DevoSenderException(
-                ERROR_MSGS.KEY_NOT_COMPATIBLE_WITH_CERT % (
-                    self.key, self.cert, str(error)
-                )) from error
+                ERROR_MSGS.KEY_NOT_COMPATIBLE_WITH_CERT % (self.key, self.cert, str(error))
+            ) from error
         return True
 
     def check_config_certificate_chain(self):
@@ -190,27 +213,24 @@ class SenderConfigSSL:
 
         :return: Boolean true or raises an exception
         """
-        with open_file(self.cert, mode="rb") as certificate_file, \
-                open_file(self.chain, mode="rb") as chain_file:
-
+        with open_file(self.cert, mode="rb") as certificate_file, open_file(
+            self.chain, mode="rb"
+        ) as chain_file:
             certificate_raw = certificate_file.read()
             chain_raw = chain_file.read()
-            certificate_obj = crypto.load_certificate(
-                crypto.FILETYPE_PEM, certificate_raw)
+            certificate_obj = crypto.load_certificate(crypto.FILETYPE_PEM, certificate_raw)
             certificates_chain = crypto.X509Store()
             for certificate in pem.parse(chain_raw):
                 certificates_chain.add_cert(
-                    crypto.load_certificate(
-                        crypto.FILETYPE_PEM, str(certificate)))
-            store_ctx = crypto.X509StoreContext(
-                certificates_chain, certificate_obj)
+                    crypto.load_certificate(crypto.FILETYPE_PEM, str(certificate))
+                )
+            store_ctx = crypto.X509StoreContext(certificates_chain, certificate_obj)
         try:
             store_ctx.verify_certificate()
         except crypto.X509StoreContextError as error:
             raise DevoSenderException(
-                ERROR_MSGS.CHAIN_NOT_COMPATIBLE_WITH_CERT % (
-                    self.chain, self.cert, str(error)
-                )) from error
+                ERROR_MSGS.CHAIN_NOT_COMPATIBLE_WITH_CERT % (self.chain, self.cert, str(error))
+            ) from error
         return True
 
     def check_config_certificate_address(self):
@@ -224,19 +244,25 @@ class SenderConfigSSL:
         sock = socket.socket()
         context = SSL.Context(SSL.TLS_CLIENT_METHOD)
         sock.settimeout(10)
+
+        # Restrict insecure protocols
+        context.set_options(SSL.OP_NO_SSLv2)
+        context.set_options(SSL.OP_NO_SSLv3)
+        context.set_options(SSL.OP_NO_TLSv1)
+        context.set_options(SSL.OP_NO_TLSv1_1)
+
         connection = SSL.Connection(context, sock)
         try:
             connection.connect(self.address)
         except socket.timeout as error:
             raise DevoSenderException(
-                ERROR_MSGS.TIMEOUT_RELATED_TO_AN_INCORRECT_ADDRESS_PORT % (
-                    str(self.address), str(error)
-                )) from error
+                ERROR_MSGS.TIMEOUT_RELATED_TO_AN_INCORRECT_ADDRESS_PORT
+                % (str(self.address), str(error))
+            ) from error
         except ConnectionRefusedError as error:
             raise DevoSenderException(
-                ERROR_MSGS.INCORRECT_ADDRESS_PORT % (
-                    str(self.address), str(error)
-                )) from error
+                ERROR_MSGS.INCORRECT_ADDRESS_PORT % (str(self.address), str(error))
+            ) from error
         sock.setblocking(True)
         connection.do_handshake()
         server_chain = connection.get_peer_cert_chain()
@@ -246,28 +272,23 @@ class SenderConfigSSL:
             chain = chain_file.read()
             chain_certs = []
             for _ca in pem.parse(chain):
-                chain_certs.append(crypto.load_certificate
-                                   (crypto.FILETYPE_PEM, str(_ca)))
+                chain_certs.append(crypto.load_certificate(crypto.FILETYPE_PEM, str(_ca)))
 
-        server_common_names = \
-            self.get_common_names(server_chain, "get_subject")
-        client_common_names = \
-            self.get_common_names(chain_certs, "get_issuer")
+        server_common_names = self.get_common_names(server_chain, "get_subject")
+        client_common_names = self.get_common_names(chain_certs, "get_issuer")
 
         if server_common_names & client_common_names:
             return True
 
         raise DevoSenderException(
-            ERROR_MSGS.CERTIFICATE_IN_ADDRESS_IS_NOT_COMPATIBLE % (
-                self.address[0], self.chain
-            ))
+            ERROR_MSGS.CERTIFICATE_IN_ADDRESS_IS_NOT_COMPATIBLE % (self.address[0], self.chain)
+        )
 
     @staticmethod
     def get_common_names(cert_chain, components_type):
         result = set()
         for temp_cert in cert_chain:
-            for key, value in getattr(temp_cert, components_type)() \
-                    .get_components():
+            for key, value in getattr(temp_cert, components_type)().get_components():
                 if key.decode("utf-8") == "CN":
                     result.add(value)
         return result
@@ -277,9 +298,7 @@ class SenderConfigSSL:
         with open_file(chain, mode="rb") as chain_file:
             chain_certs = []
             for _ca in pem.parse(chain_file.read()):
-                chain_certs.append(
-                    crypto.load_certificate(
-                        crypto.FILETYPE_PEM, str(_ca)))
+                chain_certs.append(crypto.load_certificate(crypto.FILETYPE_PEM, str(_ca)))
             return chain_certs
 
 
@@ -302,18 +321,143 @@ class SenderConfigTCP:
             self.hostname = socket.gethostname()
             self.sec_level = None
         except Exception as error:
-            raise DevoSenderException(
-                ERROR_MSGS.CANT_CREATE_TCP_CONFIG % str(error)) from error
+            raise DevoSenderException(ERROR_MSGS.CANT_CREATE_TCP_CONFIG % str(error)) from error
+
+
+class SenderBufferFlusher(Thread):
+    """ Thread class for flushing buffer if the timeout is reached.
+
+    When the "events" value from the SenderBuffer is set to 0, the wait will be set to "None" that means
+    that the "wait_object" will wait forever (until it will be "wake up").
+
+    When the "events" value from the SenderBuffer is set to greater than 0, the wait it will be set
+    to "1.0" that means that the "wait_object" will wait only 1 second.
+    This will check every second to see if the timeout has been reached.
+
+    """
+
+    DEFAULT_INTERNAL_WAIT_VALUE = 1.0
+
+    def __init__(self):
+        super().__init__()
+        self.buffer_timeout: float = 10.0
+        self.flush_buffer_func = None
+        self.__first_data_timestamp: Optional[float] = None
+        self.__running_flag = True
+        self.__wait_object: Event = Event()
+        self.__loop_wait = SenderBufferFlusher.DEFAULT_INTERNAL_WAIT_VALUE
+
+    def start(self) -> None:
+
+        # "buffer_timeout" and "flush_buffer_func" must have valid values
+        if not self.buffer_timeout or self.buffer_timeout <= 0.0:
+            raise DevoSenderException('"buffer_timeout" is required and must have a value grater than 0.0')
+        if not self.flush_buffer_func:
+            raise DevoSenderException('"flush_buffer_func" is required')
+        super().start()
+
+    def run(self):
+        while self.__running_flag:
+            if (self.__first_data_timestamp is not None
+                    and ((time.time() - self.__first_data_timestamp) >= self.buffer_timeout)):
+                self.flush_buffer_func()
+                self.__first_data_timestamp = None
+
+            # This "wait_object" can be interrupted is "set()" method is called
+            called = self.__wait_object.wait(timeout=self.__loop_wait)
+            if called:
+                self.__wait_object.clear()
+
+    def initialize_timestamp(self) -> float:
+        """ This method should be called every time the buffer transits from "0" to "greater than 0"
+
+        :return: Time mark that will be used as reference for flushing the buffer (most of the time it will not be used)
+        """
+        self.__loop_wait = SenderBufferFlusher.DEFAULT_INTERNAL_WAIT_VALUE
+        self.__first_data_timestamp = time.time()
+        if not self.__wait_object.is_set():
+            self.__wait_object.set()
+
+        return self.__first_data_timestamp
+
+    def stop(self):
+        """ Interrupts completely the Thread execution.
+
+        :return:
+        """
+        self.__running_flag = False
+        if not self.__wait_object.is_set():
+            self.__wait_object.set()
+
+    def wait(self) -> None:
+        """ Sets the thread in a "forever" wait status.
+
+        :return:
+        """
+
+        self.__loop_wait = None
+        self.__first_data_timestamp = None
+        if not self.__wait_object.is_set():
+            self.__wait_object.set()
 
 
 class SenderBuffer:
     """Micro class for buffer values"""
 
     def __init__(self):
-        self.length = 19500
-        self.compression_level = -1
-        self.text_buffer = b''
-        self.events = 0
+        self.length: int = 19500
+        self.compression_level: int = -1
+        self.text_buffer: bytes = b""
+        self.__events: int = 0
+        self.__buffer_flusher = SenderBufferFlusher()
+        self.__buffer_flusher_is_started: bool = False
+        self.use_buffer_flusher: bool = False
+
+    @property
+    def events(self) -> int:
+        return self.__events
+
+    @events.setter
+    def events(self, number_of_events):
+        """ Setter method for events
+
+        This method allows to intercept the values of the "events" attribute for being able
+        to "trigger" or "pause" the thread, this way the processing time would be optimal.
+
+        :param number_of_events:
+        :return:
+        """
+        if self.use_buffer_flusher:
+            if not self.__buffer_flusher_is_started:
+                self.__buffer_flusher_is_started = True
+                self.__buffer_flusher.start()
+
+            if self.__events == 0 and number_of_events > 0:
+                self.__buffer_flusher.initialize_timestamp()
+
+            elif number_of_events == 0:
+                self.__buffer_flusher.wait()
+
+        self.__events = number_of_events
+
+    @property
+    def buffer_flusher_func(self) -> Callable:
+        return self.__buffer_flusher.flush_buffer_func
+
+    @buffer_flusher_func.setter
+    def buffer_flusher_func(self, flusher_func: Callable):
+        self.__buffer_flusher.flush_buffer_func = flusher_func
+
+    @property
+    def buffer_timeout(self) -> float:
+        return self.__buffer_flusher.buffer_timeout
+
+    @buffer_timeout.setter
+    def buffer_timeout(self, timeout: float):
+        self.__buffer_flusher.buffer_timeout = timeout
+
+    def close(self) -> None:
+        self.__buffer_flusher.stop()
 
 
 class Sender(logging.Handler):
@@ -330,8 +474,17 @@ class Sender(logging.Handler):
     :param logger: logger. Default sys.console
     """
 
-    def __init__(self, config=None, con_type=None, inactivity_timeout=30,
-                 timeout=30, debug=False, logger=None):
+    def __init__(
+        self,
+        config=None,
+        con_type=None,
+        inactivity_timeout=30,
+        timeout=30,
+        debug=False,
+        logger=None,
+        buffer_timeout: float = 10.0,
+        use_buffer_flusher: bool = False
+    ):
         if config is None:
             raise DevoSenderException(ERROR_MSGS.PROBLEMS_WITH_SENDER_ARGS)
 
@@ -343,7 +496,11 @@ class Sender(logging.Handler):
         self.socket_max_connection = 3600 * 1000
         self.last_message = int(time.time())
         self.buffer = SenderBuffer()
+        self.buffer.buffer_timeout = buffer_timeout
+        self.buffer.buffer_flusher_func = self.flush_buffer
+        self.buffer.use_buffer_flusher = use_buffer_flusher
         self.logging = {}
+        self.buffer_lock = Lock()
 
         self.timestart = time.time()
         if isinstance(config, (dict, Configuration)):
@@ -352,19 +509,24 @@ class Sender(logging.Handler):
             config = self._from_dict(config=config, con_type=con_type)
 
         logging.Handler.__init__(self)
-        self.logger = logger if logger else \
-            get_log(handler=get_stream_handler(
-                msg_format='%(asctime)s|%(levelname)s|Devo-Sender|%(message)s')
+        self.logger = (
+            logger
+            if logger
+            else get_log(
+                handler=get_stream_handler(
+                    msg_format="%(asctime)s|%(levelname)s|Devo-Sender|%(message)s"
+                )
             )
+        )
 
         self._sender_config = config
 
         if self._sender_config.sec_level is not None:
-            self.logger.warning("Openssl's default security "
-                                "level has been overwritten to "
-                                "{}.".format(self.
-                                             _sender_config.
-                                             sec_level))
+            self.logger.warning(
+                "Openssl's default security "
+                "level has been overwritten to "
+                "{}.".format(self._sender_config.sec_level)
+            )
 
         if isinstance(config, SenderConfigSSL):
             self.__connect_ssl()
@@ -394,7 +556,8 @@ class Sender(logging.Handler):
         except socket.error as error:
             self.close()
             raise DevoSenderException(
-                ERROR_MSGS.TCP_CONN_ESTABLISHMENT_SOCKET % str(error)) from error
+                ERROR_MSGS.TCP_CONN_ESTABLISHMENT_SOCKET % str(error)
+            ) from error
 
         self.timestart = int(round(time.time() * 1000))
         self.socket.setblocking(False)
@@ -409,10 +572,11 @@ class Sender(logging.Handler):
         try:
             if self._sender_config.pkcs is not None:
                 from .pfx_to_pem import pfx_to_pem
+
                 pkcs = self._sender_config.pkcs
-                key, cert, chain = pfx_to_pem(path=pkcs.get("path", None),
-                                              password=pkcs.get("password",
-                                                                None))
+                key, cert, chain = pfx_to_pem(
+                    path=pkcs.get("path", None), password=pkcs.get("password", None)
+                )
 
                 self._sender_config.key = key.name
                 self._sender_config.cert = cert.name
@@ -420,51 +584,62 @@ class Sender(logging.Handler):
         except Exception as error:
             self.close()
             raise DevoSenderException(
-                ERROR_MSGS.PFX_CERTIFICATE_READ_FAILED % str(error)) from error
+                ERROR_MSGS.PFX_CERTIFICATE_READ_FAILED % str(error)
+            ) from error
         try:
-            if self._sender_config.key is not None \
-                    and self._sender_config.chain is not None \
-                    and self._sender_config.cert is not None:
-
-                context = ssl.create_default_context(
-                    cafile=self._sender_config.chain)
+            if (
+                self._sender_config.key is not None
+                and self._sender_config.chain is not None
+                and self._sender_config.cert is not None
+            ):
+                context = ssl.create_default_context(cafile=self._sender_config.chain)
+                context.options |= ssl.OP_NO_SSLv2
+                context.options |= ssl.OP_NO_SSLv3
+                context.minimum_version = ssl.TLSVersion.TLSv1_2
+                context.maximum_version = ssl.TLSVersion.TLSv1_3
 
                 if self._sender_config.sec_level is not None:
                     context.set_ciphers(
-                        "DEFAULT@SECLEVEL={!s}"
-                        .format(self._sender_config.sec_level))
+                        "DEFAULT@SECLEVEL={!s}".format(self._sender_config.sec_level)
+                    )
 
                 context.check_hostname = self._sender_config.check_hostname
 
                 if self._sender_config.verify_mode is not None:
                     context.verify_mode = self._sender_config.verify_mode
-
-                context.load_cert_chain(keyfile=self._sender_config.key,
-                                        certfile=self._sender_config.cert)
-                self.socket = \
-                    context.wrap_socket(
-                        self.socket,
-                        server_hostname=self._sender_config.address[0]
-                    )
+                context.load_cert_chain(
+                    keyfile=self._sender_config.key, certfile=self._sender_config.cert
+                )
+                self.socket = context.wrap_socket(
+                    self.socket, server_hostname=self._sender_config.address[0]
+                )
             else:
-                self.socket = ssl.wrap_socket(self.socket,
-                                              ssl_version=ssl.PROTOCOL_TLS,
-                                              cert_reqs=ssl.CERT_NONE)
+                context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                context.options |= ssl.OP_NO_SSLv2
+                context.options |= ssl.OP_NO_SSLv3
+                context.minimum_version = ssl.TLSVersion.TLSv1_2
+                context.maximum_version = ssl.TLSVersion.TLSv1_3
+                self.logger.warning("One or more of CA certificate, private or public certificate is not provided"
+                                    " and TLS unsecure connection is established")
+                self.socket = context.wrap_socket(self.socket)
 
             self.socket.connect(self._sender_config.address)
             self.last_message = int(time.time())
             self.reconnection += 1
             if self.debug:
-                self.logger.debug('Conected to %s|%s'
-                                  % (repr(self.socket.getpeername()),
-                                     str(self.reconnection)))
+                self.logger.debug(
+                    "Conected to %s|%s" % (repr(self.socket.getpeername()), str(self.reconnection))
+                )
             self.timestart = int(round(time.time() * 1000))
             self.socket.setblocking(False)
 
         except socket.error as error:
             self.close()
             raise DevoSenderException(
-                ERROR_MSGS.SSL_CONN_ESTABLISHMENT_SOCKET % str(error)) from error
+                ERROR_MSGS.SSL_CONN_ESTABLISHMENT_SOCKET % str(error)
+            ) from error
 
     def info(self, msg):
         """
@@ -475,7 +650,7 @@ class Sender(logging.Handler):
         """
         self.send(tag=self.logging.get("tag"), msg=msg)
 
-    # TODO: Deprecated
+    # TODO: Deprecated, to remove in next mayor version
     def set_sec_level(self, sec_level=None):
         """
         Set sec_level of SSL Context:
@@ -483,9 +658,11 @@ class Sender(logging.Handler):
         :param sec_level: sec_level value
         :return
         """
+        warnings.warn("This function is deprecated and it will be removed in future versions",
+                      DeprecationWarning, stacklevel=2)
         self._sender_config.sec_level = sec_level
 
-    # TODO: Deprecated
+    # TODO: Deprecated, to remove in next mayor version
     def set_verify_mode(self, verify_mode=None):
         """
         Set verify_mode of SSL Context:
@@ -497,9 +674,11 @@ class Sender(logging.Handler):
         :param verify_mode: verify mode value
         :return
         """
+        warnings.warn("This function is deprecated and it will be removed in future versions",
+                      DeprecationWarning, stacklevel=2)
         self._sender_config.verify_mode = verify_mode
 
-    # TODO: Deprecated
+    # TODO: Deprecated, to remove in next mayor version
     def set_check_hostname(self, check_hostname=True):
         """
         Set check_hostname of SSL Context:
@@ -507,6 +686,8 @@ class Sender(logging.Handler):
         :param check_hostname: check_hostname value. Default True
         :return
         """
+        warnings.warn("This function is deprecated and it will be removed in future versions",
+                      DeprecationWarning, stacklevel=2)
         self._sender_config.check_hostname = check_hostname
 
     def buffer_size(self, size=19500):
@@ -577,12 +758,13 @@ class Sender(logging.Handler):
         """
         Forces socket closure
         """
+        self.buffer.close()
         if self.socket is not None:
             try:
                 self.socket.shutdown(SHUT_WR)
                 self.__wait_for_EOF()
             except Exception:  # Try else continue
-                logging.exception(ERROR_MSGS.CLOSING_ERROR)
+                logging.warning(ERROR_MSGS.CLOSING_ERROR)
             finally:
                 self.socket.close()
                 self.socket = None
@@ -591,7 +773,7 @@ class Sender(logging.Handler):
     def __encode_multiline(record):
         try:
             record = Sender.__encode_record(record)
-            return b'%d %s' % (len(record), record)
+            return b"%d %s" % (len(record), record)
         except Exception as error:
             raise DevoSenderException(ERROR_MSGS.MULTILINE_SENDING_ERROR % str(error)) from error
 
@@ -603,7 +785,7 @@ class Sender(logging.Handler):
         :return: record encoded for PY3
         """
         if not isinstance(record, bytes):
-            return record.encode('utf-8')
+            return record.encode("utf-8", "replace")
         return record
 
     def __send_oc(self, record):
@@ -613,8 +795,7 @@ class Sender(logging.Handler):
         if msg_size % 4096 > 0:
             total += 1
         for iteration in range(0, total):
-            part = record[int(iteration * 4096):
-                          int((iteration + 1) * 4096)]
+            part = record[int(iteration * 4096) : int((iteration + 1) * 4096)]
             self.__sendall(part)
             self.last_message = int(time.time())
             sent += len(part)
@@ -651,7 +832,8 @@ class Sender(logging.Handler):
                         # errno.EAGAIN means nothing to get, but socket working
                         pass
                 except SSLWantWriteError:
-                    # If the data is ready at socket OS level but not at SSL wrapper level, this exception may raise
+                    # If the data is ready at socket OS level but not at
+                    # SSL wrapper level, this exception may raise
                     pass
                 # Try while timeout not reached
                 if time.time() - self.socket_timeout >= then:
@@ -674,7 +856,7 @@ class Sender(logging.Handler):
                     # Read it
                     buf = self.socket.recv(1)
                     # If no data, EOF and channel is closed
-                    return buf == b''
+                    return buf == b""
                 except BlockingIOError as exc:
                     # This is not blocking socket
                     if exc.errno == errno.ECONNRESET:
@@ -688,7 +870,8 @@ class Sender(logging.Handler):
                         # Nothing to read, everything is ok
                         return False
                 except SSLWantReadError:
-                    # If the data is ready at socket OS level but not at SSL wrapper level, this exception may raise
+                    # If the data is ready at socket OS level but not at
+                    # SSL wrapper level, this exception may raise
                     # Nothing to read, everything is ok
                     return False
         else:
@@ -711,7 +894,7 @@ class Sender(logging.Handler):
                     # Read it
                     buf = self.socket.recv(1)
                     # If no data, EOF and channel is closed
-                    if buf == b'':
+                    if buf == b"":
                         return bytes
                     else:
                         bytes.extend(buf)
@@ -727,7 +910,8 @@ class Sender(logging.Handler):
                         # errno.EAGAIN means nothing to get, but socket working
                         pass
                 except SSLWantReadError:
-                    # If the data is ready at socket OS level but not at SSL wrapper level, this exception may raise
+                    # If the data is ready at socket OS level but not at
+                    # SSL wrapper level, this exception may raise
                     pass
                 # Try while timeout not reached
                 if time.time() - self.socket_timeout >= then:
@@ -767,9 +951,7 @@ class Sender(logging.Handler):
                     raise DevoSenderException(ERROR_MSGS.SOCKET_ERROR % str(error)) from error
                 finally:
                     if self.debug:
-                        self.logger.debug(
-                            'sent|%d|size|%d|msg|%s' % (sent, len(record), record)
-                        )
+                        self.logger.debug("sent|%d|size|%d|msg|%s" % (sent, len(record), record))
             raise DevoSenderException(ERROR_MSGS.SOCKET_CANT_CONNECT_UNKNOWN_ERROR)
         except DevoSenderException:
             raise
@@ -797,17 +979,16 @@ class Sender(logging.Handler):
             send
 
         """
-        facility = kwargs.get('facility', FACILITY_USER)
-        severity = kwargs.get('severity', SEVERITY_INFO)
-        if kwargs.get('bytes', False):
-            date = kwargs.get('date', b'Jan  1 00:00:00')
-            hostname = kwargs.get('hostname',
-                                  socket.gethostname().encode("utf-8"))
-            log_format = kwargs.get('log_format', FORMAT_MY_BYTES)
+        facility = kwargs.get("facility", FACILITY_USER)
+        severity = kwargs.get("severity", SEVERITY_INFO)
+        if kwargs.get("bytes", False):
+            date = kwargs.get("date", b"Jan  1 00:00:00")
+            hostname = kwargs.get("hostname", socket.gethostname().encode("utf-8"))
+            log_format = kwargs.get("log_format", FORMAT_MY_BYTES)
         else:
-            date = kwargs.get('date', 'Jan  1 00:00:00')
-            hostname = kwargs.get('hostname', socket.gethostname())
-            log_format = kwargs.get('log_format', FORMAT_MY)
+            date = kwargs.get("date", "Jan  1 00:00:00")
+            hostname = kwargs.get("hostname", socket.gethostname())
+            log_format = kwargs.get("log_format", FORMAT_MY)
 
         return log_format % ((facility * 8) + severity, date, hostname, tag)
 
@@ -842,21 +1023,20 @@ class Sender(logging.Handler):
             msg += "\n"
 
         msg = COMPOSE % (self.compose_mem(tag, **kwargs), msg)
-        return self.send_raw(msg, multiline=kwargs.get('multiline', False))
+        return self.send_raw(msg, multiline=kwargs.get("multiline", False))
 
     def send_bytes(self, tag, msg, **kwargs):
         """
         Send function when bytes, sure py3x. Can be zipped
         """
-        msg = COMPOSE_BYTES % (
-            self.compose_mem(tag, bytes=True, **kwargs), msg)
-        if kwargs.get('zip', False):
+        msg = COMPOSE_BYTES % (self.compose_mem(tag, bytes=True, **kwargs), msg)
+        if kwargs.get("zip", False):
             return self.fill_buffer(msg)
 
         if msg[-1:] != b"\n":
             msg += b"\n"
 
-        return self.send_raw(msg, multiline=kwargs.get('multiline', False))
+        return self.send_raw(msg, multiline=kwargs.get("multiline", False))
 
     def fill_buffer(self, msg):
         """
@@ -867,8 +1047,9 @@ class Sender(logging.Handler):
         if msg[-1:] != b"\n":
             msg += b"\n"
 
-        self.buffer.text_buffer += msg
-        self.buffer.events += 1
+        with self.buffer_lock:
+            self.buffer.text_buffer += msg
+            self.buffer.events += 1
         if len(self.buffer.text_buffer) > self.buffer.length:
             return self.flush_buffer()
         return 0
@@ -878,46 +1059,69 @@ class Sender(logging.Handler):
         Method for flush-send buffer, its zipped and sent now
         :return: None
         """
-        if self.buffer.text_buffer:
-            try:
-                compressor = zlib.compressobj(self.buffer.compression_level,
-                                              zlib.DEFLATED, 31)
-                record = compressor.compress(self.buffer.text_buffer) + compressor.flush()
-                if self.send_raw(record, zip=True):
-                    return self.buffer.events
-                return 0
-            except Exception as error:
-                raise DevoSenderException(ERROR_MSGS.FLUSHING_BUFFER_ERROR) from error
-            finally:
-                self.buffer.text_buffer = b''
-                self.buffer.events = 0
-        return 0
+        with self.buffer_lock:
+            if self.buffer.text_buffer:
+                try:
+                    compressor = zlib.compressobj(self.buffer.compression_level, zlib.DEFLATED, 31)
+                    record = compressor.compress(self.buffer.text_buffer) + compressor.flush()
+                    if self.send_raw(record, zip=True):
+                        return self.buffer.events
+                    return 0
+                except Exception as error:
+                    raise DevoSenderException(ERROR_MSGS.FLUSHING_BUFFER_ERROR) from error
+                finally:
+                    self.buffer.text_buffer = b""
+                    self.buffer.events = 0
+            return 0
+
+    def get_buffer_info(self) -> dict:
+        """
+        Getter method for the buffer.
+        Useful for emergency situations when we can't send
+        :return: dict with "events" and "text_buffer" values
+        """
+        with self.buffer_lock:
+            return {
+                "events": self.buffer.events,
+                "text_buffer": self.buffer.text_buffer,
+            }
+
+    def set_buffer_info(self, text_buffer: bytes, num_events: int) -> None:
+        """
+        Setter method for the buffer.
+        Useful for emergency situations when we can't send
+        :param: text_buffer (bytes)
+        :param: num_events (int)
+        :return:
+        """
+        with self.buffer_lock:
+            self.buffer.text_buffer = text_buffer
+            self.buffer.events = num_events
 
     @staticmethod
     def for_logging(config=None, con_type=None, tag=None, level=None):
-        """ Function for create Sender object from config file to use in
+        """Function for create Sender object from config file to use in
         logging handler
         :param config: config Devo file
         :param con_type: type of connection
         :param tag: tag for the table
         :param level: level of logger
-        :param formatter: log formatter
         :return: Sender object
         """
         con = Sender(config=config, con_type=con_type)
         if tag:
-            con.logging['tag'] = tag
+            con.logging["tag"] = tag
         elif isinstance(config, dict):
-            con.logging['tag'] = config.get("tag", "my.app.log")
+            con.logging["tag"] = config.get("tag", "my.app.log")
         else:
-            con.logging['tag'] = "my.app.log"
+            con.logging["tag"] = "my.app.log"
 
         if level:
-            con.logging['level'] = level
+            con.logging["level"] = level
         elif isinstance(config, dict):
-            con.logging['level'] = config.get("verbose_level", 10)
+            con.logging["level"] = config.get("verbose_level", 10)
         else:
-            con.logging['level'] = logging.INFO
+            con.logging["level"] = logging.INFO
 
         con.logger.setLevel(con.logging.get("level"))
 
@@ -925,7 +1129,7 @@ class Sender(logging.Handler):
 
     @staticmethod
     def _from_dict(config=None, con_type=None):
-        """ Function for create Sender config object from dict file
+        """Function for create Sender config object from dict file
         :param config: config Devo file
         :param con_type: type of connection
         :param logger: logger handler, default None
@@ -934,7 +1138,7 @@ class Sender(logging.Handler):
         if con_type:
             connection_type = con_type
         elif "type" in config.keys():
-            connection_type = config['type']
+            connection_type = config["type"]
         else:
             connection_type = "SSL"
 
@@ -947,17 +1151,17 @@ class Sender(logging.Handler):
             address = (address, int(config.get("port", 443)))
 
         if connection_type == "SSL":
-            return SenderConfigSSL(address=address,
-                                   key=config.get("key", None),
-                                   cert=config.get("cert", None),
-                                   chain=config.get("chain", None),
-                                   pkcs=config.get("pkcs", None),
-                                   sec_level=config.get("sec_level", None),
-                                   verify_mode=config.get("verify_mode", None),
-                                   verify_config=config.get(
-                                       "verify_config", False),
-                                   check_hostname=config.get("check_hostname",
-                                                             True))
+            return SenderConfigSSL(
+                address=address,
+                key=config.get("key", None),
+                cert=config.get("cert", None),
+                chain=config.get("chain", None),
+                pkcs=config.get("pkcs", None),
+                sec_level=config.get("sec_level", None),
+                verify_mode=config.get("verify_mode", None),
+                verify_config=config.get("verify_config", False),
+                check_hostname=config.get("check_hostname", True),
+            )
 
         return SenderConfigTCP(address=address)
 
@@ -976,19 +1180,22 @@ class Sender(logging.Handler):
         """
         try:
             msg = self.format(record)
-            msg += '\000'
+            msg += "\000"
             try:
                 severity = priority_map.get(record.levelname, record.levelno)
             except AttributeError:
                 severity = priority_map.get("INFO")
-            self.send(tag=self.logging.get("tag", "test.keep.free"), msg=msg,
-                      facility=self.logging.get("level", FACILITY_USER),
-                      severity=severity)
+            self.send(
+                tag=self.logging.get("tag", "test.keep.free"),
+                msg=msg,
+                facility=self.logging.get("level", FACILITY_USER),
+                severity=severity,
+            )
         except Exception:
             self.handleError(record)
 
 
-def open_file(file, mode='r', encoding='utf-8'):
+def open_file(file, mode="r", encoding="utf-8"):
     """
     Helper class to open file whenever is provided as `Path` or `str` type
     :param file File to open
@@ -996,10 +1203,8 @@ def open_file(file, mode='r', encoding='utf-8'):
     :param encoding Encoding of content
     """
     if isinstance(file, Path):
-        return file.open(mode=mode,
-                         encoding=encoding if not mode.endswith('b') else None)
+        return file.open(mode=mode, encoding=encoding if not mode.endswith("b") else None)
     elif isinstance(file, str):
-        return open(file, mode=mode,
-                    encoding=encoding if not mode.endswith('b') else None)
+        return open(file, mode=mode, encoding=encoding if not mode.endswith("b") else None)
     else:
         raise DevoSenderException(ERROR_MSGS.WRONG_FILE_TYPE % str(type(file)))

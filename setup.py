@@ -2,7 +2,8 @@
 import codecs
 import os
 import re
-from setuptools import setup, find_packages
+
+from setuptools import find_packages, setup
 
 META_PATH = os.path.join("devo", "__version__.py")
 HERE = os.path.abspath(os.path.dirname(__file__))
@@ -17,18 +18,39 @@ CLASSIFIERS = [
     "Operating System :: OS Independent",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-INSTALL_REQUIRES = ['requests>=2.27', 'click==8.1.3', 'PyYAML==6.0',
-                    'pem==21.2.0', 'pyopenssl==23.0.*', 'urllib3>=1.26.5',
-                    'pytz>=2019.3', 'cryptography>=39.0.1']
-CLI = ['devo-sender=devo.sender.scripts.sender_cli:cli',
-       'devo-api=devo.api.scripts.client_cli:cli']
+INSTALL_REQUIRES = [
+    "requests~=2.32",
+    "click==8.1.7",
+    "PyYAML~=6.0.1",
+    "pem~=21.2.0",
+    "pyopenssl~=24.2.1",
+    "pytz~=2024.1",
+    "certifi~=2024.7.4",
+    "cryptography~=43.0.1",
+]
+EXTRAS_REQUIRE = {
+    "dev": [
+        "msgpack~=1.0.8",
+        "responses~=0.25.3",
+        "pipdeptree~=2.23.0",
+        "pytest~=8.2.2",
+        "pytest-cov~=5.0.0",
+        "mock~=5.1.0",
+        "pebble~=5.0.7"
+    ]
+}
+CLI = [
+    "devo-sender=devo.sender.scripts.sender_cli:cli",
+    "devo-api=devo.api.scripts.client_cli:cli",
+]
 
 
 def read(*parts):
@@ -48,8 +70,7 @@ def find_meta(meta):
     Extract __*meta*__ from META_FILE.
     """
     meta_match = re.search(
-        r"^__{meta}__ = ['\"]([^'\"]*)['\"]".format(meta=meta),
-        META_FILE, re.M
+        r"^__{meta}__ = ['\"]([^'\"]*)['\"]".format(meta=meta), META_FILE, re.M
     )
     if meta_match:
         return meta_match.group(1)
@@ -58,12 +79,9 @@ def find_meta(meta):
 
 with open("README.md", "r") as fh:
     # Replacement needed for relative links be available in PyPi
-    pattern = r'\[([^\[\]]+)\]\s?\(((?!http)[^\(\)]+)\)'
-    replace = r'[\1](https://github.com/DevoInc/python-sdk/tree/master/\2)'
-    long_description = re.sub(pattern,
-                              replace,
-                              fh.read(),
-                              flags=re.MULTILINE)
+    pattern = r"\[([^\[\]]+)\]\s?\(((?!http)[^\(\)]+)\)"
+    replace = r"[\1](https://github.com/DevoInc/python-sdk/tree/master/\2)"
+    long_description = re.sub(pattern, replace, fh.read(), flags=re.MULTILINE)
 
 setup(
     author="Devo, Inc.",
@@ -78,7 +96,6 @@ setup(
     classifiers=CLASSIFIERS,
     packages=PACKAGES,
     install_requires=INSTALL_REQUIRES,
-    entry_points={
-            'console_scripts': CLI
-        }
+    extras_require=EXTRAS_REQUIRE,
+    entry_points={"console_scripts": CLI},
 )

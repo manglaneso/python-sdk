@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """A collection of allowed operations on date parsing"""
-from datetime import datetime as dt, timedelta
+
+from datetime import datetime as dt
+import zoneinfo
+UTC = zoneinfo.ZoneInfo("UTC")
+
+from datetime import timedelta
+
 from .dateutils import to_millis, trunc_time, trunc_time_minute
 
 
@@ -57,7 +63,7 @@ def now():
     Return current millis in UTC
     :return: Millis
     """
-    return to_millis(dt.utcnow())
+    return to_millis(dt.now(UTC))
 
 
 def now_without_ms():
@@ -65,7 +71,7 @@ def now_without_ms():
     Return current millis in UTC
     :return: Millis
     """
-    return to_millis(trunc_time_minute(dt.utcnow()))
+    return to_millis(trunc_time_minute(dt.now(UTC)))
 
 
 def today():
@@ -73,7 +79,7 @@ def today():
     Return current millis with the time truncated to 00:00:00
     :return: Millis
     """
-    return to_millis(trunc_time(dt.utcnow()))
+    return to_millis(trunc_time(dt.now(UTC)))
 
 
 def yesterday():
@@ -81,7 +87,7 @@ def yesterday():
     Return millis from yesterday with time truncated to 00:00:00
     :return: Millis
     """
-    return to_millis(trunc_time(dt.utcnow()) - timedelta(days=1))
+    return to_millis(trunc_time(dt.now(UTC)) - timedelta(days=1))
 
 
 def parse_functions():
@@ -96,5 +102,5 @@ def parse_functions():
         "now": now,
         "now_without_ms": now_without_ms,
         "today": today,
-        "yesterday": yesterday
+        "yesterday": yesterday,
     }

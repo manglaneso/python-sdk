@@ -147,8 +147,8 @@ class LookupRequest:
                  visibility: Visibility = Visibility.CREATOR_ONLY):
         self.id: Id = id
         self.visibility: Visibility = visibility
-        self.recipe: Recipe = recipe
-        self.notifyStatus: bool = notify_status
+            self.recipe: Recipe = recipe
+            self.notifyStatus: bool = notify_status
 
     def toJson(self):
         # Remove null values, when invoking
